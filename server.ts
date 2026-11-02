@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import path from 'path';
@@ -30,14 +30,57 @@ function getGeminiClient(): GoogleGenAI {
   });
 }
 
-// Helper to call generateContent with retry and friendly 429 error messages
-async function callGeminiWithRetry(ai: GoogleGenAI, params: any, maxRetries = 2): Promise<any> {
+/**
+ * Call Gemini with:
+ * - 45-second timeout per call (Promise.race)
+ * - Maximum 90-second total wait across retries
+ * - Clean Korean JSON error messages on timeout and quota limits
+ */
+async function callGeminiWithTimeoutAndRetry(
+  ai: GoogleGenAI,
+  params: any,
+  maxRetries = 1
+): Promise<any> {
+  const startTime = Date.now();
+  const OVERALL_TIMEOUT_MS = 90_000; // Total 90s max
+  const CALL_TIMEOUT_MS = 45_000;    // 45s per call
+
   let attempt = 0;
+
   while (true) {
+    attempt++;
+    const elapsedOverall = Date.now() - startTime;
+    if (elapsedOverall >= OVERALL_TIMEOUT_MS) {
+      throw new Error('Gemini API 전체 대기 시간(90초)이 초과되었습니다. 잠시 후 다시 시도해 주세요.');
+    }
+
+    const remainingOverall = OVERALL_TIMEOUT_MS - elapsedOverall;
+    const currentTimeoutMs = Math.min(CALL_TIMEOUT_MS, remainingOverall);
+
+    let timerId: NodeJS.Timeout | undefined;
+    const timeoutPromise = new Promise((_, reject) => {
+      timerId = setTimeout(() => {
+        reject(new Error('GEMINI_TIMEOUT_45S'));
+      }, currentTimeoutMs);
+    });
+
     try {
-      return await ai.models.generateContent(params);
+      const callPromise = ai.models.generateContent(params);
+      const result = await Promise.race([callPromise, timeoutPromise]);
+      if (timerId) clearTimeout(timerId);
+      return result;
     } catch (err: any) {
-      attempt++;
+      if (timerId) clearTimeout(timerId);
+
+      if (err?.message === 'GEMINI_TIMEOUT_45S') {
+        const remainingTime = OVERALL_TIMEOUT_MS - (Date.now() - startTime);
+        if (attempt <= maxRetries && remainingTime > 15_000) {
+          console.warn(`Gemini call attempt ${attempt} timed out after ${currentTimeoutMs}ms. Retrying once...`);
+          continue;
+        }
+        throw new Error('Gemini 응답 시간(45초)이 초과되었습니다. 잠시 후 다시 시도해 주세요.');
+      }
+
       const errMsg = err?.message || '';
       const isRateLimit =
         err?.status === 429 ||
@@ -45,27 +88,205 @@ async function callGeminiWithRetry(ai: GoogleGenAI, params: any, maxRetries = 2)
         errMsg.includes('RESOURCE_EXHAUSTED') ||
         errMsg.includes('quota');
 
-      if (isRateLimit && attempt <= maxRetries) {
-        // Wait before retry (exponential backoff)
+      const remainingTime = OVERALL_TIMEOUT_MS - (Date.now() - startTime);
+      if (isRateLimit && attempt <= maxRetries && remainingTime > 10_000) {
         await new Promise((resolve) => setTimeout(resolve, 3000 * attempt));
         continue;
       }
+
       if (isRateLimit) {
         throw new Error(
           'Gemini API 호출 한도(429)에 일시적으로 도달했습니다. 약 30초 뒤 다시 시도해 주시거나, AI Studio의 Settings > Secrets 패널에서 유료 결제가 연결된 키를 설정해 주세요.'
         );
       }
+
       throw err;
     }
   }
 }
 
+/**
+ * Call Gemini once without retries (for RSS topic clustering).
+ * Fast fail on 429/503 so frontend can display raw RSS articles immediately.
+ */
+async function callGeminiSingleAttempt(
+  ai: GoogleGenAI,
+  params: any
+): Promise<any> {
+  const CALL_TIMEOUT_MS = 45_000;
+  let timerId: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise((_, reject) => {
+    timerId = setTimeout(() => {
+      reject(new Error('GEMINI_TIMEOUT_45S'));
+    }, CALL_TIMEOUT_MS);
+  });
+
+  try {
+    const callPromise = ai.models.generateContent(params);
+    const result = await Promise.race([callPromise, timeoutPromise]);
+    if (timerId) clearTimeout(timerId);
+    return result;
+  } catch (err: any) {
+    if (timerId) clearTimeout(timerId);
+    throw err;
+  }
+}
+
+// 7 Google News RSS Search Keywords for Manufacturing
+const RSS_KEYWORDS = [
+  '스마트팩토리',
+  '제조 AI',
+  '제조 품질',
+  '전기차 배터리',
+  '반도체 공정',
+  '조선 방산',
+  '관세 공급망',
+];
+
+interface RssArticle {
+  id: string;
+  title: string;
+  publisher: string;
+  date: string;
+  link: string;
+  category: string;
+}
+
+function cleanXmlText(str: string): string {
+  return str
+    .replace(/<!\[CDATA\[(.*?)\]\]>/g, '$1')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .trim();
+}
+
+function parseGoogleNewsRss(xml: string, category: string): RssArticle[] {
+  const items: RssArticle[] = [];
+  const itemRegex = /<item>([\s\S]*?)<\/item>/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = itemRegex.exec(xml)) !== null) {
+    const itemXml = match[1];
+    const titleMatch = itemXml.match(/<title>([\s\S]*?)<\/title>/i);
+    const linkMatch = itemXml.match(/<link>([\s\S]*?)<\/link>/i);
+    const pubDateMatch = itemXml.match(/<pubDate>([\s\S]*?)<\/pubDate>/i);
+    const sourceMatch = itemXml.match(/<source[^>]*>([\s\S]*?)<\/source>/i);
+
+    let rawTitle = titleMatch ? cleanXmlText(titleMatch[1]) : '';
+    const link = linkMatch ? cleanXmlText(linkMatch[1]) : '';
+    const pubDate = pubDateMatch ? cleanXmlText(pubDateMatch[1]) : '';
+    let publisher = sourceMatch ? cleanXmlText(sourceMatch[1]) : '';
+
+    let cleanTitle = rawTitle;
+    const lastDash = rawTitle.lastIndexOf(' - ');
+    if (lastDash > 0) {
+      if (!publisher) {
+        publisher = rawTitle.substring(lastDash + 3).trim();
+      }
+      cleanTitle = rawTitle.substring(0, lastDash).trim();
+    }
+
+    let formattedDate = pubDate;
+    if (pubDate) {
+      try {
+        const d = new Date(pubDate);
+        if (!isNaN(d.getTime())) {
+          const yyyy = d.getFullYear();
+          const mm = String(d.getMonth() + 1).padStart(2, '0');
+          const dd = String(d.getDate()).padStart(2, '0');
+          formattedDate = `${yyyy}-${mm}-${dd}`;
+        }
+      } catch (e) {
+        // preserve pubDate
+      }
+    }
+
+    if (cleanTitle && link) {
+      items.push({
+        id: `rss_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        title: cleanTitle,
+        publisher: publisher || '언론사 확인 필요',
+        date: formattedDate || '확인 필요',
+        link,
+        category,
+      });
+    }
+  }
+
+  return items;
+}
+
+async function collectManufacturingRssArticles(): Promise<RssArticle[]> {
+  const allArticles: RssArticle[] = [];
+  const seenLinks = new Set<string>();
+  const seenTitles = new Set<string>();
+
+  const fetchPromises = RSS_KEYWORDS.map(async (keyword) => {
+    try {
+      const q = encodeURIComponent(keyword) + '+when:30d';
+      const url = `https://news.google.com/rss/search?q=${q}&hl=ko&gl=KR&ceid=KR:ko`;
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/rss+xml, application/xml, text/xml, */*',
+        },
+      });
+      if (!res.ok) {
+        console.warn(`RSS fetch returned status ${res.status} for keyword '${keyword}'`);
+        return [];
+      }
+      const xml = await res.text();
+      return parseGoogleNewsRss(xml, keyword);
+    } catch (err: any) {
+      console.warn(`RSS fetch error for keyword '${keyword}':`, err?.message);
+      return [];
+    }
+  });
+
+  const settled = await Promise.allSettled(fetchPromises);
+
+  for (let i = 0; i < RSS_KEYWORDS.length; i++) {
+    const result = settled[i];
+    if (result.status === 'fulfilled' && Array.isArray(result.value)) {
+      let count = 0;
+      for (const item of result.value) {
+        if (count >= 5) break; // 최대 5건
+        const normalizedTitle = item.title.replace(/\s+/g, '').toLowerCase();
+        if (seenLinks.has(item.link) || seenTitles.has(normalizedTitle)) continue;
+        seenLinks.add(item.link);
+        seenTitles.add(normalizedTitle);
+        allArticles.push(item);
+        count++;
+      }
+    }
+  }
+
+  return allArticles;
+}
+
+// Helper to format today's date in Korean
+function getTodayString(): { todayStr: string; currentYear: number; dateIso: string } {
+  const now = new Date();
+  const currentYear = now.getFullYear();
+  const month = now.getMonth() + 1;
+  const day = now.getDate();
+  const dateIso = now.toISOString().split('T')[0];
+  const todayStr = `${currentYear}년 ${month}월 ${day}일`;
+  return { todayStr, currentYear, dateIso };
+}
+
+// --------------------------------------------------------------------------
 // 1. Resume Parse Endpoint
+// --------------------------------------------------------------------------
 app.post('/api/resume/parse', async (req: Request, res: Response) => {
   try {
     const { text, pdfBase64, mimeType } = req.body;
     if (!text && !pdfBase64) {
-      res.status(400).json({ error: '이력서 텍스트 또는 PDF 파일을 입력해 주세요.' });
+      res.status(400).json({ success: false, error: '이력서 텍스트 또는 PDF 파일을 입력해 주세요.' });
       return;
     }
 
@@ -100,7 +321,7 @@ ${text ? `\n\n[입력된 이력서 텍스트]:\n${text}` : ''}
 
     parts.push({ text: promptText });
 
-    const response = await ai.models.generateContent({
+    const response = await callGeminiWithTimeoutAndRetry(ai, {
       model: 'gemini-3.8-flash',
       contents: { parts },
       config: {
@@ -126,28 +347,20 @@ ${text ? `\n\n[입력된 이력서 텍스트]:\n${text}` : ''}
   } catch (error: any) {
     console.error('Resume parse error:', error);
     res.status(500).json({
+      success: false,
       error: `이력서 분석 중 오류가 발생했습니다: ${error.message || '알 수 없는 오류'}`,
     });
   }
 });
 
-// Helper to format today's date in Korean
-function getTodayString(): { todayStr: string; currentYear: number; dateIso: string } {
-  const now = new Date();
-  const currentYear = now.getFullYear();
-  const month = now.getMonth() + 1;
-  const day = now.getDate();
-  const dateIso = now.toISOString().split('T')[0];
-  const todayStr = `${currentYear}년 ${month}월 ${day}일`;
-  return { todayStr, currentYear, dateIso };
-}
-
+// --------------------------------------------------------------------------
 // 2. Job Recommendation Endpoint with 2-Stage Google Search
+// --------------------------------------------------------------------------
 app.post('/api/jobs/recommend', async (req: Request, res: Response) => {
   try {
     const { resume, filterRole, filterLocation } = req.body;
     if (!resume) {
-      res.status(400).json({ error: '이력 정보가 필요합니다.' });
+      res.status(400).json({ success: false, error: '이력 정보가 필요합니다.' });
       return;
     }
 
@@ -158,7 +371,7 @@ app.post('/api/jobs/recommend', async (req: Request, res: Response) => {
     const targetLocation = (filterLocation || resume.desiredLocation || '').trim();
     const locKeyword = targetLocation && targetLocation !== '전국' ? targetLocation : '';
 
-    // Step 1: Formulate at least 3 job-centric search queries with location and current year
+    // Step 1: Formulate 3 job-centric search queries with location and current year
     const queries: string[] = [];
     if (targetRole.includes('품질')) {
       queries.push(`${currentYear} 품질관리 신입 채용 ${locKeyword}`.trim());
@@ -178,13 +391,12 @@ app.post('/api/jobs/recommend', async (req: Request, res: Response) => {
       queries.push(`${currentYear} 생산기술 신입 채용 ${locKeyword}`.trim());
     }
 
-    // Include major or cert keyword if available to strengthen query relevance
     if (resume.certifications && resume.certifications.trim()) {
       const topCert = resume.certifications.split(',')[0].trim();
       queries.push(`${currentYear} ${topCert} 우대 신입 채용`.trim());
     }
 
-    // Step 2: 1단계 (Stage 1) - Call Gemini with googleSearch tool, plain text only, NO JSON schema/responseMimeType!
+    // Step 2: 1단계 (Stage 1) - Call Gemini with googleSearch tool, plain text only
     const targetQueries = queries.slice(0, 3);
     const stage1Results: Array<{ query: string; text: string; groundingLinks: Array<{ title: string; url: string }> }> = [];
 
@@ -197,12 +409,11 @@ app.post('/api/jobs/recommend', async (req: Request, res: Response) => {
 대한민국 제조기업(대기업, 중견기업, 공공기관 등)에서 현재 모집 중인 최신 신입 채용공고, 인턴십, 또는 기업 연계 교육(부트캠프) 정보를 Google 검색으로 찾아 상세히 알려주세요.
 각 공고의 회사명, 직무명, 활동 유형, 근무지, 마감일, 주요 자격요건을 본문에 자세히 서술해 주세요.
 `;
-        const response = await callGeminiWithRetry(ai, {
+        const response = await callGeminiWithTimeoutAndRetry(ai, {
           model: 'gemini-3.8-flash',
           contents: stage1Prompt,
           config: {
             tools: [{ googleSearch: {} }],
-            // Strict rule: NO responseMimeType, NO responseSchema here!
           },
         });
 
@@ -224,13 +435,10 @@ app.post('/api/jobs/recommend', async (req: Request, res: Response) => {
       }
     }
 
-    // Aggregate Stage 1 texts and unique grounding URLs
     let combinedStage1Text = '';
     const allLinksMap = new Map<string, string>(); // url -> title
-    const executedQueries: string[] = [];
 
     stage1Results.forEach((data) => {
-      executedQueries.push(data.query);
       combinedStage1Text += `\n--- [검색어: "${data.query}"] ---\n${data.text}\n`;
       data.groundingLinks.forEach((l) => {
         if (!allLinksMap.has(l.url)) {
@@ -243,8 +451,6 @@ app.post('/api/jobs/recommend', async (req: Request, res: Response) => {
       title,
       url,
     }));
-
-    const queriesUsedToReturn = targetQueries;
 
     // Step 3: 2단계 (Stage 2) - Call Gemini WITHOUT search tool to format into structured JSON
     let verifiedJobs: any[] = [];
@@ -284,7 +490,7 @@ ${JSON.stringify(uniqueGroundingLinks, null, 2)}
 7. 만약 출처 링크와 매칭되는 유효한 공고가 없다면 빈 배열([])을 반환하세요.
 `;
 
-      const stage2Response = await callGeminiWithRetry(ai, {
+      const stage2Response = await callGeminiWithTimeoutAndRetry(ai, {
         model: 'gemini-3.8-flash',
         contents: stage2Prompt,
         config: {
@@ -312,7 +518,6 @@ ${JSON.stringify(uniqueGroundingLinks, null, 2)}
 
       const parsed = JSON.parse(stage2Response.text || '[]');
       if (Array.isArray(parsed)) {
-        // Double-check: ensure URL is in uniqueGroundingLinks
         const validUrlSet = new Set(uniqueGroundingLinks.map((l) => l.url));
         verifiedJobs = parsed
           .filter((job) => job.company && job.role && validUrlSet.has(job.sourceUrl))
@@ -365,28 +570,31 @@ ${JSON.stringify(uniqueGroundingLinks, null, 2)}
 
     res.json({
       success: true,
-      queriesUsed: queriesUsedToReturn,
+      queriesUsed: targetQueries,
       jobs: verifiedJobs,
       fallback: verifiedJobs.length === 0 ? fallback : undefined,
     });
   } catch (error: any) {
     console.error('Job recommendation error:', error);
     res.status(500).json({
+      success: false,
       error: `공고 추천 중 서버 오류가 발생했습니다: ${error.message || '알 수 없는 오류'}`,
     });
   }
 });
 
+// --------------------------------------------------------------------------
 // 3. Job Diagnostic (Fit Analysis) Endpoint
+// --------------------------------------------------------------------------
 app.post('/api/jobs/diagnose', async (req: Request, res: Response) => {
   try {
     const { company, role, jobPostingText, resume } = req.body;
     if (!company || !role || !jobPostingText) {
-      res.status(400).json({ error: '회사명, 직무명, 공고 본문을 모두 입력해 주세요.' });
+      res.status(400).json({ success: false, error: '회사명, 직무명, 공고 본문을 모두 입력해 주세요.' });
       return;
     }
     if (!resume || (!resume.major && !resume.tools && !resume.experience)) {
-      res.status(400).json({ error: '먼저 [내 이력] 탭에서 이력을 입력하고 저장해 주세요.' });
+      res.status(400).json({ success: false, error: '먼저 [내 이력] 탭에서 이력을 입력하고 저장해 주세요.' });
       return;
     }
 
@@ -420,7 +628,7 @@ app.post('/api/jobs/diagnose', async (req: Request, res: Response) => {
 ${jobPostingText}
 `;
 
-    const response = await ai.models.generateContent({
+    const response = await callGeminiWithTimeoutAndRetry(ai, {
       model: 'gemini-3.8-flash',
       contents: prompt,
       config: {
@@ -530,94 +738,79 @@ ${jobPostingText}
   } catch (error: any) {
     console.error('Job diagnosis error:', error);
     res.status(500).json({
+      success: false,
       error: `공고 진단 중 오류가 발생했습니다: ${error.message || '알 수 없는 오류'}`,
     });
   }
 });
 
-// 4-1. Fetch Today's Hot Manufacturing Issues with 2-Stage Google Search
+// --------------------------------------------------------------------------
+// 4-1. Fetch Today's Hot Manufacturing Issues via Google News RSS & Gemini Clustering
+// --------------------------------------------------------------------------
 app.post('/api/trends/fetch-hot-issues', async (req: Request, res: Response) => {
   try {
-    const { targetRole } = req.body;
+    const { targetRole, cachedRssArticles } = req.body;
     const role = targetRole || '품질관리, 스마트팩토리, 생산기술';
-    const ai = getGeminiClient();
-    const { todayStr, currentYear } = getTodayString();
+    const { todayStr } = getTodayString();
 
-    const searchQuery = `${currentYear}년 최근 한국 제조업 뉴스 스마트팩토리 제조AI 품질 배터리 반도체 조선 방산 공급망`;
-    const queriesUsed = [searchQuery];
+    // 1. Collect RSS articles across 7 manufacturing keywords (or use cached RSS articles if re-analyzing)
+    let rssArticles: RssArticle[] = [];
+    if (Array.isArray(cachedRssArticles) && cachedRssArticles.length > 0) {
+      rssArticles = cachedRssArticles;
+    } else {
+      rssArticles = await collectManufacturingRssArticles();
+    }
 
-    // Stage 1: Google Search, plain text only, NO JSON schema / responseMimeType
-    const stage1Prompt = `
-오늘 날짜: ${todayStr} (${currentYear}년)
-최근 30일 동안의 대한민국 제조업 핵심 산업 뉴스를 Google 검색으로 찾아주세요.
-주요 검색 분야: 스마트팩토리, 제조 AI, 품질 및 인증 규제, 전기차 및 배터리, 반도체 제조 공정, 조선/해양, 방산, 글로벌 관세 및 공급망 이슈.
+    // If RSS collection completely failed (0 articles gathered)
+    if (rssArticles.length === 0) {
+      res.status(502).json({
+        success: false,
+        error: 'Google 뉴스 RSS 피드를 수집하지 못했습니다. 네트워크 상태를 확인한 후 잠시 후 다시 시도해 주세요.',
+        rssArticles: [],
+      });
+      return;
+    }
 
-최근 언론 및 포털에서 반복적으로 다루어진 핫이슈와 주요 제조기업(현대차, 삼성, LG, 포스코, 한화 등)의 기술/투자 동향을 본문 텍스트로 자세히 정리해 주세요.
-`;
+    // 2. Format articles for single Gemini clustering call
+    // Instruct Gemini strictly not to speculate beyond article titles and publishers
+    const articlesText = rssArticles
+      .map(
+        (a, idx) =>
+          `[기사 ${idx + 1}] [${a.category}] ${a.title} | 언론사: ${a.publisher} | 보도날짜: ${a.date}`
+      )
+      .join('\n');
 
-    const stage1Response = await callGeminiWithRetry(ai, {
-      model: 'gemini-3.8-flash',
-      contents: stage1Prompt,
-      config: {
-        tools: [{ googleSearch: {} }],
-        // Strict: NO responseMimeType, NO responseSchema here!
-      },
-    });
-
-    const stage1Text = stage1Response.text || '';
-    const chunks = stage1Response.candidates?.[0]?.groundingMetadata?.groundingChunks || [];
-    const groundingLinks: Array<{ title: string; url: string }> = [];
-
-    chunks.forEach((chunk: any) => {
-      const uri = chunk.web?.uri;
-      const title = chunk.web?.title || '';
-      if (uri && (uri.startsWith('http://') || uri.startsWith('https://'))) {
-        groundingLinks.push({ title, url: uri });
-      }
-    });
-
-    const uniqueLinks = Array.from(
-      new Map(groundingLinks.map((l) => [l.url, l])).values()
-    );
-
-    let issues: any[] = [];
-
-    // Stage 2: Call Gemini WITHOUT search tool to structure into top 5 hot issues with responseMimeType: 'application/json'
-    if (uniqueLinks.length > 0 && stage1Text.trim().length > 0) {
-      const stage2Prompt = `
-당신은 대한민국 제조업 취업 멘토이자 산업 분석가입니다.
-오늘 날짜는 ${todayStr}입니다.
+    const prompt = `
+당신은 대한민국 제조업(품질관리, 스마트팩토리, 생산기술 직무) 취업 멘토이자 산업 분석가입니다.
 지원자의 희망 직무는 '${role}'입니다.
+오늘 날짜는 ${todayStr}입니다.
 
-아래는 1단계 Google 실시간 검색을 통해 수집된 최근 30일 제조업 뉴스 텍스트와, 검색 시스템(groundingChunks)에서 확인된 실제 출처 기사 웹 링크 목록입니다.
+아래는 Google 뉴스 RSS를 통해 실시간으로 수집된 최근 30일 대한민국 제조업 핵심 기사 목록(총 ${rssArticles.length}건)입니다.
 
-[1단계 검색 결과 본문]
-${stage1Text}
+[수집된 RSS 기사 목록]:
+${articlesText}
 
-[검증된 실제 출처 기사 링크 목록 (groundingChunks)]
-${JSON.stringify(uniqueLinks, null, 2)}
-
-[엄격한 2단계 구조화 규칙 - 절대 준수]
-1. 여러 언론 및 출처에서 반복적으로 다루어진 핵심 핫이슈를 우선하여 최대 5개를 선정하세요.
-2. 각 이슈에는 반드시 위 [검증된 실제 출처 기사 링크 목록]에 실제로 존재하는 출처 링크를 1개 이상 "sourceUrls" 배열에 포함해야 합니다.
-   - 출처 링크 목록에 없는 임의의 링크를 만들지 마세요.
-   - 출처 링크가 없는 이슈는 절대로 보여주지 마세요 (출처 없는 이슈는 목록에서 완전 제외).
-3. 보도 날짜(date)를 본문에서 명확히 확인하지 못하면 '확인 필요'로 표기하세요.
-4. 각 이슈마다 다음 항목을 충실히 작성하세요:
-   - title: 이슈 제목
-   - domain: 분야 ('스마트팩토리' | '제조 AI' | '품질' | '전기차/배터리' | '반도체' | '조선' | '방산' | '관세/공급망' 등)
-   - date: 보도 날짜 (미확인 시 '확인 필요')
-   - threeLineSummary: 핵심 내용 3줄 요약 (문자열 3개 배열)
-   - whyItMatters: 제조업계 관점에서 왜 중요한지
+[엄격한 분석 및 구조화 규칙 - 절대 준수]
+1. 주제가 유사하거나 여러 언론사에서 반복하여 보도된 핵심 사안을 우선하여 핫이슈 최대 5개를 도출하세요.
+2. 기사 목록에 없는 사실은 절대 추측하지 마세요. 기사 본문을 읽지 않았으므로 기사 제목과 언론사 정보로 알 수 없는 구체적인 수치나 세부 내용은 절대 지어내지 마세요.
+3. 각 이슈마다 해당 이슈로 묶인 기사의 번호 목록을 "articleNumbers" 배열에 반드시 1개 이상 지정하세요 (예: [1, 3]).
+4. 각 이슈마다 다음 필드를 작성하세요:
+   - title: 핵심 이슈 제목 (명확하고 직관적인 표제)
+   - domain: 분야 ('스마트팩토리' | '제조 AI' | '제조 품질' | '전기차 배터리' | '반도체 공정' | '조선 방산' | '관세 공급망' 중 선택)
+   - whyItMatters: 제조업계 관점에서 왜 중요한지 (기사 제목과 업계 배경에 기반한 영향도)
    - roleRelevance: 지원자의 희망 직무('${role}') 관점에서의 구체적인 관련성
    - selfIntroMaterial: 자기소개서 지원동기 및 직무역량 문항에 활용할 수 있는 구체적인 소재
    - interviewQuestions: 면접관이 물어볼 수 있는 예상 면접 질문 3개 (question, intent, answerTip)
-   - sourceUrls: [{ title, url }] (반드시 groundingChunks 목록에 있는 링크)
+   - articleNumbers: 해당 이슈와 관련된 기사 번호 배열 (예: [1, 2, 5])
 `;
 
-      const stage2Response = await callGeminiWithRetry(ai, {
+    const ai = getGeminiClient();
+
+    try {
+      // Call Gemini once (NO automatic retries on 429 or 503)
+      const geminiResponse = await callGeminiSingleAttempt(ai, {
         model: 'gemini-3.8-flash',
-        contents: stage2Prompt,
+        contents: prompt,
         config: {
           responseMimeType: 'application/json',
           responseSchema: {
@@ -625,14 +818,8 @@ ${JSON.stringify(uniqueLinks, null, 2)}
             items: {
               type: Type.OBJECT,
               properties: {
-                title: { type: Type.STRING, description: '이슈 제목' },
+                title: { type: Type.STRING, description: '핵심 이슈 제목' },
                 domain: { type: Type.STRING, description: '분야' },
-                date: { type: Type.STRING, description: "보도 날짜 (미확인 시 '확인 필요')" },
-                threeLineSummary: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                  description: '핵심 내용 3줄',
-                },
                 whyItMatters: { type: Type.STRING, description: '왜 중요한지' },
                 roleRelevance: { type: Type.STRING, description: '희망 직무와의 관련성' },
                 selfIntroMaterial: { type: Type.STRING, description: '자기소개서 작성 소재' },
@@ -649,80 +836,114 @@ ${JSON.stringify(uniqueLinks, null, 2)}
                   },
                   description: '예상 질문 3개',
                 },
-                sourceUrls: {
+                articleNumbers: {
                   type: Type.ARRAY,
-                  items: {
-                    type: Type.OBJECT,
-                    properties: {
-                      title: { type: Type.STRING },
-                      url: { type: Type.STRING },
-                    },
-                    required: ['title', 'url'],
-                  },
-                  description: '반드시 groundingChunks 목록에 있는 출처 링크 1개 이상',
+                  items: { type: Type.INTEGER },
+                  description: '해당 이슈에 포함된 기사 번호 (1부터 시작하는 정수 배열)',
                 },
               },
               required: [
                 'title',
                 'domain',
-                'date',
-                'threeLineSummary',
                 'whyItMatters',
                 'roleRelevance',
                 'selfIntroMaterial',
                 'interviewQuestions',
-                'sourceUrls',
+                'articleNumbers',
               ],
             },
           },
         },
       });
 
-      const parsed = JSON.parse(stage2Response.text || '[]');
+      const parsed = JSON.parse(geminiResponse.text || '[]');
+      const issues: any[] = [];
+
       if (Array.isArray(parsed)) {
-        const validUrlSet = new Set(uniqueLinks.map((l) => l.url));
-        issues = parsed
-          .filter((item) => {
-            const verifiedSources = (item.sourceUrls || []).filter((s: any) => validUrlSet.has(s.url));
-            return item.title && verifiedSources.length > 0;
-          })
-          .slice(0, 5)
-          .map((item, idx) => ({
+        parsed.slice(0, 5).forEach((item: any, idx: number) => {
+          const numbers: number[] = Array.isArray(item.articleNumbers) ? item.articleNumbers : [];
+          const matchedSources = numbers
+            .map((num) => rssArticles[num - 1])
+            .filter((a): a is RssArticle => Boolean(a));
+
+          const finalSources = matchedSources.length > 0 ? matchedSources : [rssArticles[idx % rssArticles.length]];
+
+          const dates = finalSources
+            .map((s) => s.date)
+            .filter((d) => d && d !== '확인 필요')
+            .sort()
+            .reverse();
+          const issueDate = dates[0] || finalSources[0]?.date || '확인 필요';
+
+          // 5. 카드의 출처 제목, 언론사, 날짜, 링크는 Gemini가 쓴 값이 아니라 RSS 원본 값을 사용해 줘.
+          issues.push({
             id: `issue_${Date.now()}_${idx}`,
             title: item.title,
-            domain: item.domain || '제조 혁신',
-            date: item.date && item.date.trim() ? item.date : '확인 필요',
-            threeLineSummary: Array.isArray(item.threeLineSummary) ? item.threeLineSummary : [],
+            domain: item.domain || finalSources[0]?.category || '제조 혁신',
+            date: issueDate,
+            threeLineSummary: [
+              `${finalSources.map((s) => s.publisher).filter(Boolean).slice(0, 3).join(', ')} 등 다수 언론 보도`,
+              `${item.domain || finalSources[0]?.category || '제조'} 분야 최신 동향`,
+              item.whyItMatters ? (item.whyItMatters.length > 60 ? item.whyItMatters.slice(0, 60) + '...' : item.whyItMatters) : '제조업계 영향도 주목',
+            ],
             whyItMatters: item.whyItMatters || '',
             roleRelevance: item.roleRelevance || '',
             selfIntroMaterial: item.selfIntroMaterial || '',
             interviewQuestions: Array.isArray(item.interviewQuestions) ? item.interviewQuestions : [],
-            sourceUrls: (item.sourceUrls || []).filter((s: any) => validUrlSet.has(s.url)),
-          }));
+            sourceUrls: finalSources.map((src) => ({
+              title: `${src.title} (${src.publisher})`,
+              url: src.link,
+              publisher: src.publisher,
+              date: src.date,
+            })),
+          });
+        });
       }
-    }
 
-    res.json({
-      success: true,
-      queriesUsed,
-      targetRole: role,
-      searchDate: todayStr,
-      issues,
-    });
+      res.json({
+        success: true,
+        aiAnalysisSuccess: true,
+        queriesUsed: RSS_KEYWORDS,
+        targetRole: role,
+        searchDate: todayStr,
+        issues,
+        rssArticles,
+        searchedAt: new Date().toISOString(),
+      });
+    } catch (aiError: any) {
+      console.warn('Gemini clustering failed or rate-limited:', aiError?.message);
+      // Requirement: Gemini에서 429나 503 오류가 나면 자동으로 반복 호출하지 마.
+      // 이때는 RSS로 모은 기사를 분야별 목록으로 보여 주고,
+      // 'AI 분석은 잠시 후 다시 시도할 수 있습니다'라고 안내해 줘. '다시 분석하기' 버튼도 넣어 줘.
+      res.json({
+        success: true,
+        aiAnalysisSuccess: false,
+        aiError: 'AI 분석은 잠시 후 다시 시도할 수 있습니다',
+        queriesUsed: RSS_KEYWORDS,
+        targetRole: role,
+        searchDate: todayStr,
+        issues: [],
+        rssArticles,
+        searchedAt: new Date().toISOString(),
+      });
+    }
   } catch (error: any) {
     console.error('Fetch hot issues error:', error);
     res.status(500).json({
-      error: `제조업 핫이슈 검색 중 서버 오류가 발생했습니다: ${error.message || '알 수 없는 오류'}`,
+      success: false,
+      error: `제조업 핫이슈 처리 중 서버 오류가 발생했습니다: ${error.message || '알 수 없는 오류'}`,
     });
   }
 });
 
+// --------------------------------------------------------------------------
 // 4-2. Industry Trends Direct Article Analysis Endpoint
+// --------------------------------------------------------------------------
 app.post('/api/trends/analyze', async (req: Request, res: Response) => {
   try {
     const { title, date, link, articleText, desiredRole } = req.body;
     if (!title || !articleText) {
-      res.status(400).json({ error: '기사 제목과 본문을 입력해 주세요.' });
+      res.status(400).json({ success: false, error: '기사 제목과 본문을 입력해 주세요.' });
       return;
     }
 
@@ -749,7 +970,7 @@ app.post('/api/trends/analyze', async (req: Request, res: Response) => {
 ${articleText}
 `;
 
-    const response = await ai.models.generateContent({
+    const response = await callGeminiWithTimeoutAndRetry(ai, {
       model: 'gemini-3.8-flash',
       contents: prompt,
       config: {
@@ -803,21 +1024,23 @@ ${articleText}
   } catch (error: any) {
     console.error('Trend analysis error:', error);
     res.status(500).json({
+      success: false,
       error: `산업 동향 분석 중 오류가 발생했습니다: ${error.message || '알 수 없는 오류'}`,
     });
   }
 });
 
+// --------------------------------------------------------------------------
 // 5. Job Comparison & Competency Clustering Endpoint
+// --------------------------------------------------------------------------
 app.post('/api/comparison/cluster', async (req: Request, res: Response) => {
   try {
     const { diagnoses } = req.body;
     if (!diagnoses || !Array.isArray(diagnoses) || diagnoses.length === 0) {
-      res.status(400).json({ error: '비교할 진단 결과가 없습니다.' });
+      res.status(400).json({ success: false, error: '비교할 진단 결과가 없습니다.' });
       return;
     }
 
-    // Extract all unmet / partially met items across all saved postings
     const unmetItems: Array<{ company: string; role: string; requirement: string; category: string; action: string }> = [];
     
     diagnoses.forEach((diag: any) => {
@@ -834,7 +1057,6 @@ app.post('/api/comparison/cluster', async (req: Request, res: Response) => {
           });
         }
       });
-      // Also include items from improvementPlan
       (diag.improvementPlan || []).forEach((plan: any) => {
         if (!unmetItems.some(item => item.requirement === plan.unmetRequirement && item.company === comp)) {
           unmetItems.push({
@@ -874,7 +1096,7 @@ ${JSON.stringify(unmetItems, null, 2)}
 2. 가장 많이 나온 역량 상위 3개(topCompetencies)를 선정하고, 각 역량별로 제조 취준생이 지금 당장 실행할 수 있는 구체적인 '다음에 할 일'(추천 자격증, 학습 코스, 포트폴리오 제작 팁)을 제시해 주세요.
 `;
 
-    const response = await ai.models.generateContent({
+    const response = await callGeminiWithTimeoutAndRetry(ai, {
       model: 'gemini-3.8-flash',
       contents: prompt,
       config: {
@@ -932,12 +1154,41 @@ ${JSON.stringify(unmetItems, null, 2)}
   } catch (error: any) {
     console.error('Comparison clustering error:', error);
     res.status(500).json({
+      success: false,
       error: `역량 비교 분석 중 오류가 발생했습니다: ${error.message || '알 수 없는 오류'}`,
     });
   }
 });
 
-// Dev mode with Vite middleware or Production static files
+// --------------------------------------------------------------------------
+// Strictly Handle All Unmatched /api/* Routes as JSON 404
+// (Ensures no API route can ever fall through to Vite HTML / SPA index.html)
+// --------------------------------------------------------------------------
+app.all('/api/*', (req: Request, res: Response) => {
+  res.status(404).json({
+    success: false,
+    error: `요청하신 API 주소(${req.method} ${req.path})를 찾을 수 없습니다. 올바른 API 엔드포인트인지 확인해 주세요.`,
+  });
+});
+
+// --------------------------------------------------------------------------
+// Global Error Handler for /api and Express
+// --------------------------------------------------------------------------
+app.use((err: any, req: Request, res: Response, _next: NextFunction) => {
+  console.error('Global Express Error:', err);
+  if (res.headersSent) return;
+
+  const status = Number(err.status || err.statusCode) || 500;
+  res.status(status).json({
+    success: false,
+    error: `서버 내부 오류가 발생했습니다: ${err.message || '알 수 없는 오류'}`,
+  });
+});
+
+// --------------------------------------------------------------------------
+// Dev mode with Vite middleware OR Production Static SPA Serving
+// (Mounted ONLY after all API routes and API 404 handlers)
+// --------------------------------------------------------------------------
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({

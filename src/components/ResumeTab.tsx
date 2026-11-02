@@ -2,6 +2,8 @@ import React, { useState } from 'react';
 import { ResumeData } from '../types';
 import { SAMPLE_RESUMES } from '../data/samples';
 import { copyTextToClipboard } from '../utils/storage';
+import { safeFetchJson, ApiErrorDetail } from '../utils/apiClient';
+import { ApiErrorBox } from './ApiErrorBox';
 import {
   ShieldAlert,
   FileText,
@@ -34,6 +36,7 @@ export const ResumeTab: React.FC<ResumeTabProps> = ({
 
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [errorDetail, setErrorDetail] = useState<ApiErrorDetail | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
@@ -44,76 +47,79 @@ export const ResumeTab: React.FC<ResumeTabProps> = ({
 
     if (file.type !== 'application/pdf') {
       setErrorMessage('PDF 파일만 업로드할 수 있습니다.');
+      setErrorDetail(null);
       return;
     }
 
     if (file.size > 10 * 1024 * 1024) {
       setErrorMessage('파일 크기가 10MB를 초과할 수 없습니다.');
+      setErrorDetail(null);
       return;
     }
 
     setErrorMessage(null);
+    setErrorDetail(null);
     setSelectedFileName(file.name);
 
     const reader = new FileReader();
     reader.onload = () => {
       const result = reader.result as string;
-      // Extract base64 without prefix data:application/pdf;base64,
       const base64Data = result.split(',')[1];
       setPdfBase64(base64Data);
       setPdfMimeType(file.type);
     };
     reader.onerror = () => {
       setErrorMessage('파일을 읽는 중 문제가 발생했습니다.');
+      setErrorDetail(null);
     };
     reader.readAsDataURL(file);
   };
 
-  // Trigger Gemini auto-extraction
+  // Trigger Gemini auto-extraction with safe JSON handling
   const handleAutoExtract = async () => {
     if (!bulkText.trim() && !pdfBase64) {
       setErrorMessage('이력서 텍스트를 붙여넣거나 PDF 파일을 먼저 등록해 주세요.');
+      setErrorDetail(null);
       return;
     }
 
     setIsLoading(true);
     setErrorMessage(null);
+    setErrorDetail(null);
     setStatusMessage(null);
 
-    try {
-      const response = await fetch('/api/resume/parse', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text: bulkText.trim(),
-          pdfBase64,
-          mimeType: pdfMimeType,
-        }),
-      });
+    const apiRes = await safeFetchJson<{ success: boolean; data: any }>('/api/resume/parse', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: bulkText.trim(),
+        pdfBase64,
+        mimeType: pdfMimeType,
+      }),
+    });
 
-      const resData = await response.json();
-      if (!response.ok || !resData.success) {
-        throw new Error(resData.error || '이력서 분석에 실패했습니다.');
-      }
+    setIsLoading(false);
 
-      const extracted = resData.data;
-      setFormData((prev) => ({
-        ...prev,
-        major: extracted.major || prev.major,
-        certifications: extracted.certifications || prev.certifications,
-        languages: extracted.languages || prev.languages,
-        tools: extracted.tools || prev.tools,
-        experience: extracted.experience || prev.experience,
-        desiredRole: extracted.desiredRole || prev.desiredRole,
-        desiredLocation: extracted.desiredLocation || prev.desiredLocation,
-      }));
-
-      setStatusMessage('Gemini가 내용을 성공적으로 읽어왔습니다! 아래 항목을 확인하고 수정한 뒤 저장해 주세요.');
-    } catch (err: any) {
-      setErrorMessage(err.message || '이력서 추출 중 네트워크 오류가 발생했습니다.');
-    } finally {
-      setIsLoading(false);
+    if (!apiRes.ok || !apiRes.data?.data) {
+      setErrorMessage(apiRes.error || '이력서 분석에 실패했습니다.');
+      setErrorDetail(apiRes.errorDetail || null);
+      // Requirement 7: Keep bulkText and formData intact
+      return;
     }
+
+    const extracted = apiRes.data.data;
+    setFormData((prev) => ({
+      ...prev,
+      major: extracted.major || prev.major,
+      certifications: extracted.certifications || prev.certifications,
+      languages: extracted.languages || prev.languages,
+      tools: extracted.tools || prev.tools,
+      experience: extracted.experience || prev.experience,
+      desiredRole: extracted.desiredRole || prev.desiredRole,
+      desiredLocation: extracted.desiredLocation || prev.desiredLocation,
+    }));
+
+    setStatusMessage('Gemini가 내용을 성공적으로 읽어왔습니다! 아래 항목을 확인하고 수정한 뒤 저장해 주세요.');
   };
 
   // Load sample preset
@@ -284,10 +290,12 @@ ${formData.experience || '미입력'}
 
         {/* Feedback Messages */}
         {errorMessage && (
-          <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700 flex items-start gap-2">
-            <AlertCircle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
-            <span>{errorMessage}</span>
-          </div>
+          <ApiErrorBox
+            error={errorMessage}
+            errorDetail={errorDetail}
+            onRetry={handleAutoExtract}
+            title="이력서 자동 입력 오류"
+          />
         )}
         {statusMessage && (
           <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-800 flex items-start gap-2">

@@ -2,6 +2,8 @@ import React, { useState, useEffect } from 'react';
 import { ResumeData, JobDiagnosisResult, ComparisonTableRow } from '../types';
 import { SAMPLE_JOB_POSTINGS } from '../data/samples';
 import { isResumeEmpty, copyTextToClipboard } from '../utils/storage';
+import { safeFetchJson, ApiErrorDetail } from '../utils/apiClient';
+import { ApiErrorBox } from './ApiErrorBox';
 import {
   FileSearch,
   Sparkles,
@@ -39,6 +41,7 @@ export const DiagnoseTab: React.FC<DiagnoseTabProps> = ({
 
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [errorDetail, setErrorDetail] = useState<ApiErrorDetail | null>(null);
   const [currentResult, setCurrentResult] = useState<JobDiagnosisResult | null>(null);
   const [copied, setCopied] = useState(false);
   const [filterVerdict, setFilterVerdict] = useState<string>('전체');
@@ -61,58 +64,61 @@ export const DiagnoseTab: React.FC<DiagnoseTabProps> = ({
     setLink(sample.url);
     setJobPostingText(sample.text);
     setErrorMessage(null);
+    setErrorDetail(null);
   };
 
-  // Run analysis via Gemini
+  // Run analysis via Gemini with safe JSON parsing
   const handleDiagnose = async () => {
     if (emptyResume) {
       setErrorMessage('내 이력이 비어 있습니다. [내 이력] 탭에서 이력을 먼저 작성해 주세요.');
+      setErrorDetail(null);
       return;
     }
     if (!company.trim() || !role.trim() || !jobPostingText.trim()) {
       setErrorMessage('회사명, 직무명, 공고 본문을 모두 입력해 주세요.');
+      setErrorDetail(null);
       return;
     }
 
     setIsLoading(true);
     setErrorMessage(null);
+    setErrorDetail(null);
 
-    try {
-      const response = await fetch('/api/jobs/diagnose', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          company: company.trim(),
-          role: role.trim(),
-          jobPostingText: jobPostingText.trim(),
-          resume,
-        }),
-      });
-
-      const resData = await response.json();
-      if (!response.ok || !resData.success) {
-        throw new Error(resData.error || '공고 진단에 실패했습니다.');
-      }
-
-      const diagnosisData: JobDiagnosisResult = {
-        id: `diag_${Date.now()}`,
-        createdAt: new Date().toISOString(),
+    const apiRes = await safeFetchJson<{ success: boolean; data: any }>('/api/jobs/diagnose', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
         company: company.trim(),
         role: role.trim(),
-        jobPostingUrl: link.trim(),
         jobPostingText: jobPostingText.trim(),
-        summary: resData.data.summary,
-        comparisonTable: resData.data.comparisonTable,
-        improvementPlan: resData.data.improvementPlan,
-      };
+        resume,
+      }),
+    });
 
-      setCurrentResult(diagnosisData);
-      onSaveDiagnosis(diagnosisData); // Auto-save to localStorage
-    } catch (err: any) {
-      setErrorMessage(err.message || '공고 진단 중 오류가 발생했습니다.');
-    } finally {
-      setIsLoading(false);
+    setIsLoading(false);
+
+    if (!apiRes.ok || !apiRes.data?.data) {
+      setErrorMessage(apiRes.error || '공고 진단에 실패했습니다.');
+      setErrorDetail(apiRes.errorDetail || null);
+      // Requirement 7: Keep company, role, link, jobPostingText intact
+      return;
     }
+
+    const resData = apiRes.data;
+    const diagnosisData: JobDiagnosisResult = {
+      id: `diag_${Date.now()}`,
+      createdAt: new Date().toISOString(),
+      company: company.trim(),
+      role: role.trim(),
+      jobPostingUrl: link.trim(),
+      jobPostingText: jobPostingText.trim(),
+      summary: resData.data.summary,
+      comparisonTable: resData.data.comparisonTable,
+      improvementPlan: resData.data.improvementPlan,
+    };
+
+    setCurrentResult(diagnosisData);
+    onSaveDiagnosis(diagnosisData); // Auto-save to localStorage
   };
 
   // Copy full diagnosis report to clipboard
@@ -333,10 +339,12 @@ ${currentResult.improvementPlan
         </button>
 
         {errorMessage && (
-          <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700 flex items-start gap-2">
-            <AlertCircle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
-            <span>{errorMessage}</span>
-          </div>
+          <ApiErrorBox
+            error={errorMessage}
+            errorDetail={errorDetail}
+            onRetry={handleDiagnose}
+            title="공고 진단 오류"
+          />
         )}
       </div>
 

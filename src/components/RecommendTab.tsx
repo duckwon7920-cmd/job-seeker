@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
-import { ResumeData, RecommendedJob, ZeroResultFallback } from '../types';
+import { ResumeData, RecommendedJob, ZeroResultFallback, RecommendJobResponse } from '../types';
 import { isResumeEmpty, copyTextToClipboard } from '../utils/storage';
+import { safeFetchJson, ApiErrorDetail } from '../utils/apiClient';
+import { ApiErrorBox } from './ApiErrorBox';
 import {
   Search,
   ExternalLink,
@@ -40,53 +42,54 @@ export const RecommendTab: React.FC<RecommendTabProps> = ({
   const [queriesUsed, setQueriesUsed] = useState<string[]>([]);
   const [fallbackData, setFallbackData] = useState<ZeroResultFallback | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [errorDetail, setErrorDetail] = useState<ApiErrorDetail | null>(null);
   const [isServerError, setIsServerError] = useState(false);
   const [hasSearched, setHasSearched] = useState(false);
   const [copiedIndex, setCopiedIndex] = useState<number | null>(null);
 
   const emptyResume = isResumeEmpty(resume);
 
-  // Search jobs using 2-stage Gemini + Google Search Grounding
+  // Search jobs using 2-stage Gemini + Google Search Grounding with safe JSON parsing
   const handleSearchJobs = async () => {
     if (emptyResume) {
       setErrorMessage('내 이력이 비어 있습니다. [내 이력] 탭에서 이력을 먼저 작성해 주세요.');
+      setErrorDetail(null);
       setIsServerError(false);
       return;
     }
 
     setIsLoading(true);
     setErrorMessage(null);
+    setErrorDetail(null);
     setIsServerError(false);
     setHasSearched(true);
     setFallbackData(null);
 
-    try {
-      const response = await fetch('/api/jobs/recommend', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          resume,
-          filterRole,
-          filterLocation,
-        }),
-      });
+    const apiRes = await safeFetchJson<RecommendJobResponse>('/api/jobs/recommend', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        resume,
+        filterRole,
+        filterLocation,
+      }),
+    });
 
-      const resData = await response.json();
-      if (!response.ok || !resData.success) {
-        setIsServerError(true);
-        throw new Error(resData.error || '공고 추천 서버 처리 중 오류가 발생했습니다.');
-      }
+    setIsLoading(false);
 
-      setQueriesUsed(resData.queriesUsed || []);
-      setRecommendations(resData.jobs || []);
-      if (resData.fallback) {
-        setFallbackData(resData.fallback);
-      }
-    } catch (err: any) {
+    if (!apiRes.ok || !apiRes.data) {
       setIsServerError(true);
-      setErrorMessage(err.message || '공고 검색 중 서버 통신 오류가 발생했습니다.');
-    } finally {
-      setIsLoading(false);
+      setErrorMessage(apiRes.error || '공고 추천 서버 처리 중 오류가 발생했습니다.');
+      setErrorDetail(apiRes.errorDetail || null);
+      // Requirement 7: Keep filters and resume intact
+      return;
+    }
+
+    const resData = apiRes.data;
+    setQueriesUsed(resData.queriesUsed || []);
+    setRecommendations(resData.jobs || []);
+    if (resData.fallback) {
+      setFallbackData(resData.fallback);
     }
   };
 
@@ -255,23 +258,12 @@ export const RecommendTab: React.FC<RecommendTabProps> = ({
 
       {/* 1. SERVER ERROR DISPLAY */}
       {isServerError && errorMessage && (
-        <div className="p-4 bg-red-50 border-2 border-red-300 rounded-2xl text-xs sm:text-sm text-red-800 space-y-2">
-          <div className="flex items-center gap-2 font-bold text-red-900">
-            <AlertOctagon className="w-5 h-5 text-red-600 shrink-0" />
-            <span>서버 통신 오류가 발생했습니다</span>
-          </div>
-          <p className="text-red-700 leading-relaxed">{errorMessage}</p>
-          <div className="pt-1">
-            <button
-              type="button"
-              onClick={handleSearchJobs}
-              className="px-3.5 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded-lg text-xs font-bold transition-colors inline-flex items-center gap-1"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              <span>다시 시도하기</span>
-            </button>
-          </div>
-        </div>
+        <ApiErrorBox
+          error={errorMessage}
+          errorDetail={errorDetail}
+          onRetry={handleSearchJobs}
+          title="공고 추천 서버 오류"
+        />
       )}
 
       {/* 2. ZERO RESULT DISPLAY (Separated from Server Error) */}

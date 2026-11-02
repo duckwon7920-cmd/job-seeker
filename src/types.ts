@@ -89,12 +89,21 @@ export interface TrendAnalysisResult {
   interviewQuestions: InterviewQuestionItem[];
 }
 
+export interface RssArticleItem {
+  id: string;
+  title: string;
+  publisher: string;
+  date: string;
+  link: string;
+  category: string;
+}
+
 export interface ManufacturingIssue {
   id: string;
   title: string;
   domain: string;
   date: string;
-  threeLineSummary: string[];
+  threeLineSummary?: string[];
   whyItMatters: string;
   roleRelevance: string;
   selfIntroMaterial: string;
@@ -102,6 +111,8 @@ export interface ManufacturingIssue {
   sourceUrls: Array<{
     title: string;
     url: string;
+    publisher?: string;
+    date?: string;
   }>;
 }
 
@@ -110,6 +121,9 @@ export interface SavedIssuesState {
   targetRole: string;
   queriesUsed: string[];
   issues: ManufacturingIssue[];
+  rssArticles?: RssArticleItem[];
+  aiAnalysisSuccess?: boolean;
+  aiErrorMessage?: string;
 }
 
 export interface CompetencyCluster {

@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { JobDiagnosisResult, ComparisonClusterResult } from '../types';
 import { copyTextToClipboard } from '../utils/storage';
+import { safeFetchJson, ApiErrorDetail } from '../utils/apiClient';
+import { ApiErrorBox } from './ApiErrorBox';
 import {
   BarChart3,
   Trash2,
@@ -30,6 +32,7 @@ export const CompareTab: React.FC<CompareTabProps> = ({
   const [clusterData, setClusterData] = useState<ComparisonClusterResult | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [errorDetail, setErrorDetail] = useState<ApiErrorDetail | null>(null);
   const [copied, setCopied] = useState(false);
 
   // Trigger clustering when diagnoses list changes and has items
@@ -41,25 +44,26 @@ export const CompareTab: React.FC<CompareTabProps> = ({
 
     setIsLoading(true);
     setErrorMessage(null);
+    setErrorDetail(null);
 
-    try {
-      const response = await fetch('/api/comparison/cluster', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ diagnoses: items }),
-      });
+    const apiRes = await safeFetchJson<{
+      success: boolean;
+      data: ComparisonClusterResult;
+    }>('/api/comparison/cluster', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ diagnoses: items }),
+    });
 
-      const resData = await response.json();
-      if (!response.ok || !resData.success) {
-        throw new Error(resData.error || '역량 비교 분석에 실패했습니다.');
-      }
+    setIsLoading(false);
 
-      setClusterData(resData.data);
-    } catch (err: any) {
-      setErrorMessage(err.message || '역량 군집화 중 오류가 발생했습니다.');
-    } finally {
-      setIsLoading(false);
+    if (!apiRes.ok || !apiRes.data) {
+      setErrorMessage(apiRes.error || '역량 비교 분석에 실패했습니다.');
+      setErrorDetail(apiRes.errorDetail || null);
+      return;
     }
+
+    setClusterData(apiRes.data.data);
   };
 
   useEffect(() => {
@@ -232,10 +236,12 @@ ${clusterData.topCompetencies
 
       {/* Error Message */}
       {errorMessage && (
-        <div className="p-4 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700 flex items-start gap-2">
-          <AlertCircle className="w-4 h-4 shrink-0 text-red-600 mt-0.5" />
-          <span>{errorMessage}</span>
-        </div>
+        <ApiErrorBox
+          error={errorMessage}
+          errorDetail={errorDetail}
+          onRetry={() => fetchClustering(diagnoses)}
+          title="역량 비교 분석 중 오류가 발생했습니다"
+        />
       )}
 
       {/* 2. Horizontal Bar Chart of Unmet Competency Clusters */}
