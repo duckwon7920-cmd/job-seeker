@@ -1,0 +1,6 @@
+{
+  "name": "공고 진단기 - 제조 직무 채용공고 분석 및 맞춤 추천기",
+  "description": "품질관리, 스마트팩토리, 생산기술 직무 취업준비생을 위한 이력 기반 공고 추천, 공고 요건 진단 및 갭 분석, 최신 산업동향 분석 서비스",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
